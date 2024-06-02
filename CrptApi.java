@@ -7,41 +7,39 @@ import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 
 import org.apache.http.HttpEntity;
-import org.apache.http.HttpResponse;
-import org.apache.http.client.ClientProtocolException;
-import org.apache.http.client.ResponseHandler;
+import org.apache.http.client.methods.CloseableHttpResponse;
 import org.apache.http.client.methods.HttpPost;
-import org.apache.http.client.protocol.HttpClientContext;
-import org.apache.http.concurrent.FutureCallback;
 import org.apache.http.entity.ContentType;
 import org.apache.http.entity.StringEntity;
-import org.apache.http.impl.client.FutureRequestExecutionService;
+import org.apache.http.impl.client.CloseableHttpClient;
 import org.apache.http.impl.client.HttpClientBuilder;
-import org.apache.http.impl.client.HttpRequestFutureTask;
+import org.apache.http.util.EntityUtils;
 
 import com.fasterxml.jackson.annotation.JsonAutoDetect;
 import com.fasterxml.jackson.annotation.JsonFormat;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.annotation.JsonPropertyOrder;
-import com.fasterxml.jackson.core.exc.StreamWriteException;
-import com.fasterxml.jackson.databind.DatabindException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
 public class CrptApi {
 	private int requestLimit;
 	private TimeUnit timeUnit;
+	private Scheduler scheduler; 
 	
+	public Scheduler getScheduler() {
+		return scheduler;
+	}
+
 	CrptApi(TimeUnit timeUnit, int requestLimit) {
 		this.timeUnit = timeUnit;
 		this.requestLimit = requestLimit;
+		this.scheduler = new Scheduler(this.requestLimit);
 	}
 
 	private Order prepareOrder(Order order) throws ParseException {
@@ -75,61 +73,74 @@ public class CrptApi {
 		return order;
 	}
 
-	private class Invoker implements Runnable {
-		ExecutorService executorService = Executors.newCachedThreadPool();
+	public void createOrder(Order order) throws ParseException {
+		order = prepareOrder(order);
+		scheduler.sendOrderBySchedule("https://ismp.crpt.ru/api/v3/lk/documents/create", order);
+	}
+	
+	private class Scheduler {
+		private ScheduledExecutorService schedulerService;
+		private Semaphore semaphore;
+		
+		private Scheduler(int poolSize) {
+			schedulerService = Executors.newScheduledThreadPool(poolSize);
+			semaphore = new Semaphore(poolSize);
+		}
+		
+		private void sendOrderBySchedule(String url, Order order) {
+			schedulerService.schedule(new Issue(url, order, semaphore), 1, timeUnit);
+		}
+		
+		private void sendOrderBySchedule(String url, Order order, long delay) {
+			schedulerService.schedule(new Issue(url, order, semaphore), delay, timeUnit);
+		}
+		
+		private void stop() {
+			schedulerService.shutdown();
+		}
+		
+	}
+	
+	private class Issue implements Runnable {
+		private String url;
+		private Order order;
+		private Semaphore semaphore;
+		
+		private Issue(String url, Order order, Semaphore semaphore) {
+			this.url = url;
+			this.order = order;
+			this.semaphore = semaphore;
+		}
 		
 		@Override
 		public void run() {
-			sendOrder("https://ismp.crpt.ru/api/v3/lk/documents/create", new Order());
+			sendOrder(url, order);
 		}
 
 		private void sendOrder(String url, Order order) {
-			try (FutureRequestExecutionService executionService = new FutureRequestExecutionService(
-					HttpClientBuilder.create().setMaxConnPerRoute(requestLimit).setMaxConnTotal(requestLimit).build(),
-					executorService)) {
-				
-				ResponseHandler<Boolean> handler = new ResponseHandler<Boolean>() {
-					@Override
-					public Boolean handleResponse(HttpResponse response) throws ClientProtocolException, IOException {
-						return response.getStatusLine().getStatusCode() == 200;
-					}
-				};
-				
+			try (CloseableHttpClient httpClient = HttpClientBuilder.create().setMaxConnPerRoute(requestLimit).setMaxConnTotal(requestLimit * 2).build()) {
 				HttpPost httpPost = new HttpPost(url);
-				String jsonOrder = new ObjectMapper().writer().writeValueAsString(CrptApi.this.prepareOrder(order));
+				String jsonOrder = new ObjectMapper().writer().writeValueAsString(order);
 
-				HttpEntity stringEntity = new StringEntity(jsonOrder, ContentType.APPLICATION_JSON);
+				StringEntity stringEntity = new StringEntity(jsonOrder, ContentType.APPLICATION_JSON);
 				httpPost.setEntity(stringEntity);
 				httpPost.setHeader("Content-type", "application/json");
-
-				FutureCallback<Boolean> callback = new FutureCallback<Boolean>() {
-					@Override
-					public void completed(Boolean result) {
-						System.out.println("Cоздан документ: " + result);
-					}
-
-					@Override
-					public void failed(Exception ex) {
-						System.out.println("Произошла ошибка: " + ex.getMessage());
-					}
-
-					@Override
-					public void cancelled() {
-						System.out.println("Отмена операции");
-					}
-				};
-
-				HttpRequestFutureTask<Boolean> futureTask = executionService.execute(httpPost,
-						HttpClientContext.create(), handler, callback);
-				Boolean requisitionResult = futureTask.get(1, timeUnit);
-				System.out.println("Результат заявки: " + (requisitionResult ? "успешно" : "завершено с ошибкой"));
-			} catch (IOException | ParseException e) {
+				
+				semaphore.acquire();
+				try (CloseableHttpResponse response = httpClient.execute(httpPost)) {
+					//Thread.sleep(1000);
+					System.out.println(response.getStatusLine().getStatusCode() + " " + response.getStatusLine().getReasonPhrase());
+					
+					HttpEntity enttity = response.getEntity();
+					String result = EntityUtils.toString(enttity);
+					System.out.println(result);
+					
+					EntityUtils.consume(enttity);
+				}
+				semaphore.release();
+			} catch (IOException e) {
 				e.printStackTrace();
 			} catch (InterruptedException e) {
-				e.printStackTrace();
-			} catch (ExecutionException e) {
-				e.printStackTrace();
-			} catch (TimeoutException e) {
 				e.printStackTrace();
 			}
 		}
@@ -200,16 +211,15 @@ public class CrptApi {
 
 	}
 
-	public static void main(String[] args) throws StreamWriteException, DatabindException, IOException, ParseException, InterruptedException {
-		CrptApi api = new CrptApi(TimeUnit.SECONDS, 5);
-		ThreadPoolExecutor es = (ThreadPoolExecutor) Executors.newFixedThreadPool(10);
+	public static void main(String[] args) throws ParseException, InterruptedException {
+		CrptApi api = new CrptApi(TimeUnit.SECONDS, 3);
 		
 		for (int i = 0; i < 10; i++) {
-			es.execute(api.new Invoker());
-			Thread.sleep(300);
-			System.out.println("Invoke: " +i);
+			api.createOrder(api.new Order());
+			// Thread.sleep(100);
 		}
-		es.shutdown();
+		
+		// api.getScheduler().stop();
 	}
 
 }
